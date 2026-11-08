@@ -310,44 +310,48 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
     const STEER_BATCH_SIZE = 128;
     const PATH_BATCH_SIZE = 16;
     const MAX_TASK_BATCHES = 512;
+    const PHASE_RING = 4; // 4-way ring-buffered phase state eliminates cross-phase worker bleed
 
-    // 64-byte cache-line padded Int32 control indices (16 Int32s per cache line)
+    // 64-byte cache-line padded Int32 control indices
     const CTRL = {
       TASK_EPOCH: 0,
-      TASK_TYPE: 1,
-      TOTAL_BATCHES: 2,
-      SPIN_MODE: 3,
-      WORLD_VERSION: 4,
-      ONLINE_WORKERS: 5,
-      TARGET_WORKERS: 6,
+      SPIN_MODE: 1,
+      WORLD_VERSION: 2,
+      ONLINE_WORKERS: 3,
+      TARGET_WORKERS: 4,
 
-      WORK_CURSOR: 16,
-      DONE_BATCHES: 32,
+      // 4-element ring arrays indexed by (epoch & 3)
+      TASK_TYPE_0: 8,        // 8..11
+      TOTAL_BATCHES_0: 12,   // 12..15
 
-      RENDER_READY_SLOT: 48,
-      ACTIVE_AGENTS: 49,
-      ARRIVED_COUNT: 50,
-      FRAME_NUM: 51,
-      FLOW_ALLOC_COUNT: 52,
-      CORRIDOR_ALLOC_COUNT: 53,
+      // Cache-line isolated per-ring-slot atomic cursors & completion counters
+      WORK_CURSOR_0: 16,     // 16, 32, 48, 64 (stride 16 = 64B cache line each)
+      DONE_BATCHES_0: 80,    // 80, 96, 112, 128 (stride 16 = 64B cache line each)
 
-      URGENT_HEAD: 64,
-      URGENT_TAIL: 65,
-      BULK_HEAD: 66,
-      BULK_TAIL: 67,
+      RENDER_READY_SLOT: 144,
+      ACTIVE_AGENTS: 145,
+      ARRIVED_COUNT: 146,
+      FRAME_NUM: 147,
+      FLOW_ALLOC_COUNT: 148,
+      CORRIDOR_ALLOC_COUNT: 149,
 
-      GRID_W: 80,
-      GRID_H: 81,
-      GRID_CX: 82,
-      GRID_CY: 83,
-      PORTAL_COUNT: 84,
-      EDGE_COUNT: 85,
-      GOAL_CELL: 86,
-      GOAL_CHUNK: 87,
-      HASH_COLS: 88,
-      HASH_ROWS: 89,
-      HASH_BUCKETS: 90,
-      HASH_NUM_BATCHES: 91
+      URGENT_HEAD: 160,
+      URGENT_TAIL: 161,
+      BULK_HEAD: 162,
+      BULK_TAIL: 163,
+
+      GRID_W: 176,
+      GRID_H: 177,
+      GRID_CX: 178,
+      GRID_CY: 179,
+      PORTAL_COUNT: 180,
+      EDGE_COUNT: 181,
+      GOAL_CELL: 182,
+      GOAL_CHUNK: 183,
+      HASH_COLS: 184,
+      HASH_ROWS: 185,
+      HASH_BUCKETS: 186,
+      HASH_NUM_BATCHES: 187
     };
 
     const CTRL_F = {
@@ -423,9 +427,9 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         offset += byteLength;
       };
 
-      reserve('ctrl', Int32Array, 128);
+      reserve('ctrl', Int32Array, 256);
       reserve('ctrlFloat', Float64Array, 32);
-      reserve('batchState', Int32Array, MAX_TASK_BATCHES);
+      reserve('batchState', Int32Array, PHASE_RING * MAX_TASK_BATCHES);
 
       // 1. Agent SoA Pool
       reserve('px', Float32Array, MAX_AGENTS);
@@ -534,22 +538,25 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         tripleBuffer,
         setGraphRef(graph) {
           currentGraphRef = graph;
-          corridorObjCache.fill(null);
-        },
-        resetGoalCorridors() {
           views.cellCorridorSlot.fill(-1);
           Atomics.store(views.ctrl, CTRL.CORRIDOR_ALLOC_COUNT, 0);
           corridorObjCache.fill(null);
+        },
+        resetGoalCorridors() {
+          // Only clear cell-to-corridor lookup table; do NOT reset CORRIDOR_ALLOC_COUNT
+          // to 0 so agents still in bulkQ can safely read their previous corridor slots!
+          views.cellCorridorSlot.fill(-1);
         },
         getCorridorObject(cSlot) {
           if (cSlot < 0 || cSlot >= MAX_CORRIDORS) return null;
           let obj = corridorObjCache[cSlot];
           const ver = Atomics.load(views.ctrl, CTRL.WORLD_VERSION);
-          if (obj && obj._ver === ver && obj.goalCell === views.corridorGoalCell[cSlot]) {
+          const gCell = views.corridorGoalCell[cSlot];
+          const cLen = Atomics.load(views.corridorLen, cSlot);
+          if (cLen <= 0) return null;
+          if (obj && obj._ver === ver && obj.goalCell === gCell && obj.chunks.length === cLen) {
             return obj;
           }
-          const cLen = views.corridorLen[cSlot];
-          if (cLen <= 0) return null;
           const pLen = cLen - 1;
           const base = cSlot * MAX_CORRIDOR_STEPS;
           const chunks = new Int32Array(cLen);
@@ -560,7 +567,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
             portals,
             chunks,
             cost: views.corridorCost[cSlot],
-            goalCell: views.corridorGoalCell[cSlot],
+            goalCell: gCell,
             goalX: views.corridorGoalX[cSlot],
             goalY: views.corridorGoalY[cSlot],
             graph: currentGraphRef,
@@ -590,7 +597,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       } = views;
 
       // Thread-local scratch structures for Eikonal integration and Macro A*
-      const heapIt = new Int32Array( MAX_PORTALS + 512);
+      const heapIt = new Int32Array(MAX_PORTALS + 512);
       const heapK = new Float64Array(MAX_PORTALS + 512);
       let heapSz = 0, heapLastKey = 0;
       const heapClear = () => { heapSz = 0; };
@@ -616,6 +623,9 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
 
       const eikCosts = new Uint8Array(CC);
       const eikDist = new Float64Array(CC);
+      const localFlowInt = new Float32Array(CC);
+      const localFlowX = new Float32Array(CC);
+      const localFlowY = new Float32Array(CC);
       const aStarG = new Float64Array(MAX_PORTALS + 2);
       const aStarParent = new Int32Array(MAX_PORTALS + 2);
       const aStarParentChunk = new Int32Array(MAX_PORTALS + 2);
@@ -721,7 +731,12 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       function getOrBuildFlowFieldShared(chunkId, kindCode, tid, sources, numSources, exX, exY, canWait) {
         const key = (tid * 2 + kindCode) * 65536 + chunkId;
         const mask = FLOW_CAP - 1;
-        let slot = (Math.imul(key | 0, 0x9e3779b1) >>> 0) & mask;
+        // Full 32-bit avalanche hash mixing tid, kindCode, and chunkId across all 2048 slots
+        let h = Math.imul((tid << 1) | kindCode, 0x9e3779b1) ^ Math.imul(chunkId + 1, 0x85ebca6b);
+        h ^= h >>> 16;
+        h = Math.imul(h, 0x7feb352d);
+        h ^= h >>> 15;
+        let slot = (h >>> 0) & mask;
         const W = ctrl[CTRL.GRID_W], cx = ctrl[CTRL.GRID_CX];
 
         for (let probe = 0; probe < FLOW_CAP; probe++) {
@@ -730,7 +745,15 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
 
           if (st === 0) {
             if (Atomics.compareExchange(flowState, slot, 0, 1) === 0) {
-              flowKeys[slot] = key;
+              // Build into thread-local buffers first so no reader ever observes partial integration
+              integrateChunkFlat(W, cx, chunkId, sources, numSources, localFlowInt);
+              computeFlowVectorsFlat(localFlowInt, localFlowX, localFlowY, exX, exY);
+
+              const cBase = slot * CC;
+              flowIntegration.set(localFlowInt, cBase);
+              flowX.set(localFlowX, cBase);
+              flowY.set(localFlowY, cBase);
+
               const mBase = slot * 6;
               flowMeta[mBase] = chunkId;
               flowMeta[mBase + 1] = kindCode;
@@ -738,13 +761,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
               flowMeta[mBase + 3] = (chunkId / cx | 0) * CS;
               flowMeta[mBase + 4] = -1;
               flowMeta[mBase + 5] = 0;
-
-              const cBase = slot * CC;
-              const intSub = flowIntegration.subarray(cBase, cBase + CC);
-              const fxSub = flowX.subarray(cBase, cBase + CC);
-              const fySub = flowY.subarray(cBase, cBase + CC);
-              integrateChunkFlat(W, cx, chunkId, sources, numSources, intSub);
-              computeFlowVectorsFlat(intSub, fxSub, fySub, exX, exY);
+              flowKeys[slot] = key;
 
               Atomics.add(ctrl, CTRL.FLOW_ALLOC_COUNT, 1);
               Atomics.store(flowState, slot, 2);
@@ -757,18 +774,24 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
 
           if (st === 1) {
             let spins = 0;
-            while (Atomics.load(flowState, slot) === 1 && ++spins < 512) {}
+            while (Atomics.load(flowState, slot) === 1 && ++spins < 50000) {}
             if (canWait && SUPPORTS_SAB && Atomics.load(flowState, slot) === 1) {
-              Atomics.wait(flowState, slot, 1, 2);
+              Atomics.wait(flowState, slot, 1, 5);
             }
             if (Atomics.load(flowState, slot) === 2 && flowKeys[slot] === key) return slot;
           }
 
           slot = (slot + 1) & mask;
         }
-        // Evict slot on full table wrap
-        const evictSlot = (Math.imul(key | 0, 0x9e3779b1) >>> 0) & mask;
-        flowKeys[evictSlot] = key;
+
+        // Safe atomic eviction into thread-local buffer first
+        const evictSlot = (h >>> 0) & mask;
+        integrateChunkFlat(W, cx, chunkId, sources, numSources, localFlowInt);
+        computeFlowVectorsFlat(localFlowInt, localFlowX, localFlowY, exX, exY);
+        const cBase = evictSlot * CC;
+        flowIntegration.set(localFlowInt, cBase);
+        flowX.set(localFlowX, cBase);
+        flowY.set(localFlowY, cBase);
         const mBase = evictSlot * 6;
         flowMeta[mBase] = chunkId;
         flowMeta[mBase + 1] = kindCode;
@@ -776,14 +799,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         flowMeta[mBase + 3] = (chunkId / cx | 0) * CS;
         flowMeta[mBase + 4] = -1;
         flowMeta[mBase + 5] = 0;
-        const cBase = evictSlot * CC;
-        integrateChunkFlat(W, cx, chunkId, sources, numSources, flowIntegration.subarray(cBase, cBase + CC));
-        computeFlowVectorsFlat(
-          flowIntegration.subarray(cBase, cBase + CC),
-          flowX.subarray(cBase, cBase + CC),
-          flowY.subarray(cBase, cBase + CC),
-          exX, exY
-        );
+        flowKeys[evictSlot] = key;
         Atomics.store(flowState, evictSlot, 2);
         return evictSlot;
       }
@@ -836,10 +852,9 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       }
 
       function findMacroPathIntoSlab(startCell, canWait) {
-        // Check shared cell-to-corridor deduplication table first
         let existing = Atomics.load(cellCorridorSlot, startCell);
         if (existing >= 0) return existing;
-        if (existing === -3) return -1; // Known unreachable
+        if (existing === -3) return -1;
 
         if (existing === -1) {
           if (Atomics.compareExchange(cellCorridorSlot, startCell, -1, -2) !== -1) {
@@ -848,9 +863,9 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         }
         if (existing === -2) {
           let spins = 0;
-          while (Atomics.load(cellCorridorSlot, startCell) === -2 && ++spins < 512) {}
+          while (Atomics.load(cellCorridorSlot, startCell) === -2 && ++spins < 50000) {}
           if (canWait && SUPPORTS_SAB && Atomics.load(cellCorridorSlot, startCell) === -2) {
-            Atomics.wait(cellCorridorSlot, startCell, -2, 2);
+            Atomics.wait(cellCorridorSlot, startCell, -2, 5);
           }
           const resolved = Atomics.load(cellCorridorSlot, startCell);
           if (resolved >= 0) return resolved;
@@ -1009,9 +1024,17 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         }
 
         const cLen = corridorLen[cSlot];
+        if (cLen <= 0) {
+          enqueueUrgentFlat(i);
+          return -1;
+        }
         const pLen = cLen - 1;
         const cBase = cSlot * MAX_CORRIDOR_STEPS;
         let idx = pathIdx[i];
+        if (idx < 0 || idx >= cLen) {
+          idx = pathIdx[i] = 0;
+          fieldSlot[i] = -1;
+        }
 
         if (corridorChunks[cBase + idx] !== chunk) {
           let found = -1;
@@ -1051,9 +1074,16 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       }
 
       function collideAgentFlat(i, W, H, r) {
-        let x = clamp(px[i], r, W - r), y = clamp(py[i], r, H - r);
-        if (x !== px[i]) vx[i] = 0;
-        if (y !== py[i]) vy[i] = 0;
+        let pxVal = px[i], pyVal = py[i];
+        if (!Number.isFinite(pxVal) || !Number.isFinite(pyVal)) {
+          const cell = findNearestWalkableFlat(W >> 1, H >> 1, 32);
+          pxVal = cell >= 0 ? (cell % W) + 0.5 : W * 0.5;
+          pyVal = cell >= 0 ? (cell / W | 0) + 0.5 : H * 0.5;
+          vx[i] = vy[i] = 0;
+        }
+        let x = clamp(pxVal, r, W - r), y = clamp(pyVal, r, H - r);
+        if (x !== pxVal) vx[i] = 0;
+        if (y !== pyVal) vy[i] = 0;
         const ccx = Math.min(W - 1, x | 0), ccy = Math.min(H - 1, y | 0);
         if (gridCosts[ccy * W + ccx] >= COST_BLOCK) {
           const cell = findNearestWalkableFlat(ccx, ccy, 24);
@@ -1106,8 +1136,8 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
           const histBase = batchIdx * B;
           batchHist.fill(0, histBase, histBase + B);
           for (let i = i0; i < i1; i++) {
-            const bx = clamp(Math.floor(px[i] / cs), 0, cols - 1);
-            const by = clamp(Math.floor(py[i] / cs), 0, rows - 1);
+            const bx = clamp(Math.floor(px[i] / cs), 0, cols - 1) | 0;
+            const by = clamp(Math.floor(py[i] / cs), 0, rows - 1) | 0;
             const b = by * cols + bx;
             hashBucketOf[i] = b;
             batchHist[histBase + b]++;
@@ -1138,7 +1168,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
           for (let i = i0; i < i1; i++) {
             const b = hashBucketOf[i];
             const dst = hashStart[b] + (batchOffset[offBase + b]++);
-            hashItems[dst] = i;
+            if (dst >= 0 && dst < n) hashItems[dst] = i;
           }
           return;
         }
@@ -1154,15 +1184,15 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
           for (let i = i0; i < i1; i++) {
             const xi = px[i], yi = py[i], gi = goalCell[i];
             let sx = 0, sy = 0, cx = 0, cy = 0, touch = 0, checked = 0;
-            const bx = clamp(Math.floor(xi / cs), 0, cols - 1);
-            const by = clamp(Math.floor(yi / cs), 0, rows - 1);
+            const bx = clamp(Math.floor(xi / cs), 0, cols - 1) | 0;
+            const by = clamp(Math.floor(yi / cs), 0, rows - 1) | 0;
             neighborLoop:
             for (let yy = Math.max(0, by - 1), y1 = Math.min(rows - 1, by + 1); yy <= y1; yy++) {
               for (let xx = Math.max(0, bx - 1), x1 = Math.min(cols - 1, bx + 1); xx <= x1; xx++) {
                 const b = yy * cols + xx;
-                for (let k = hashStart[b], end = hashStart[b + 1]; k < end; k++) {
+                for (let k = Math.max(0, hashStart[b]), end = Math.min(n, hashStart[b + 1]); k < end; k++) {
                   const j = hashItems[k];
-                  if (j === i) continue;
+                  if (j === i || j < 0 || j >= n) continue;
                   let dx = xi - px[j], dy = yi - py[j], d2 = dx * dx + dy * dy;
                   if (d2 >= sepR2) continue;
                   let d = Math.sqrt(d2);
@@ -1204,10 +1234,10 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
             const tCell = clamp(px[i] | 0, 0, W - 1) + clamp(py[i] | 0, 0, H - 1) * W;
             const tCost = gridCosts[tCell];
             const terrainMult = tCost === COST_HIGHWAY ? 1.45 : tCost === COST_MUD ? 0.55 : 1.0;
-            const cSlot = corridorSlot[i];
 
             if (st === 1) {
               const fSlot = resolveFieldForAgentFlat(i, canWait);
+              const cSlot = corridorSlot[i];
               if (fSlot >= 0) {
                 const mBase = fSlot * 6;
                 if (sampleFlowBilinearFlat(fSlot, px[i], py[i], headingScratch)) {
@@ -1234,12 +1264,12 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
                 const idx = pathIdx[i];
                 const pLen = corridorLen[cSlot] - 1;
                 const cBase = cSlot * MAX_CORRIDOR_STEPS;
-                if (idx < pLen) {
+                if (idx >= 0 && idx < pLen) {
                   Atomics.add(portalTargets, corridorPortals[cBase + idx], 1);
-                }
-                for (let k = idx; k < pLen; k++) {
-                  const pid = corridorPortals[cBase + k];
-                  if (portalOnPath[pid] === 0) portalOnPath[pid] = 1;
+                  for (let k = idx; k < pLen; k++) {
+                    const pid = corridorPortals[cBase + k];
+                    if (portalOnPath[pid] === 0) portalOnPath[pid] = 1;
+                  }
                 }
               }
             }
@@ -1255,8 +1285,9 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
             py[i] += nvy * h + corrY[i] * 0.5;
             collideAgentFlat(i, W, H, r);
 
-            if (cSlot >= 0 && (st === 1 || st === 2)) {
-              const d = Math.hypot(corridorGoalX[cSlot] - px[i], corridorGoalY[cSlot] - py[i]);
+            const cSlotAfter = corridorSlot[i];
+            if (cSlotAfter >= 0 && (st === 1 || st === 2)) {
+              const d = Math.hypot(corridorGoalX[cSlotAfter] - px[i], corridorGoalY[cSlotAfter] - py[i]);
               if (st === 1 && (d < 0.75 || (touching[i] && d < contagR))) {
                 state[i] = st = 2;
               } else if (st === 2 && d > leaveR) {
@@ -1290,7 +1321,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
     const SHARED_ARENA = createSharedArena();
     SHARED_ARENA.kernel = buildSharedKernel(SHARED_ARENA.views);
 
-    // Self-contained Web Worker Pool using inline Blob URL
+    // Self-contained Web Worker Pool using 4-way ring-buffered phase slots
     class SABWorkerPool {
       constructor(arena) {
         this.arena = arena;
@@ -1313,6 +1344,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
           const FLOW_CAP = ${FLOW_CAP}, MAX_PORTALS = ${MAX_PORTALS}, MAX_CORRIDORS = ${MAX_CORRIDORS}, MAX_CORRIDOR_STEPS = ${MAX_CORRIDOR_STEPS};
           const HASH_BATCH_SIZE = ${HASH_BATCH_SIZE}, BUCKET_REDUCE_BATCH = ${BUCKET_REDUCE_BATCH};
           const SEP_BATCH_SIZE = ${SEP_BATCH_SIZE}, STEER_BATCH_SIZE = ${STEER_BATCH_SIZE}, PATH_BATCH_SIZE = ${PATH_BATCH_SIZE};
+          const MAX_TASK_BATCHES = ${MAX_TASK_BATCHES};
           const SUPPORTS_SAB = true;
           const CTRL = ${JSON.stringify(CTRL)};
           const CTRL_F = ${JSON.stringify(CTRL_F)};
@@ -1355,18 +1387,23 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
               }
               lastEpoch = epoch;
 
-              const taskType = Atomics.load(ctrl, CTRL.TASK_TYPE);
+              const ringSlot = epoch & 3;
+              const taskType = Atomics.load(ctrl, CTRL.TASK_TYPE_0 + ringSlot);
               if (taskType === TASK.EXIT) break;
               if (taskType === TASK.IDLE) continue;
 
-              const totalBatches = Atomics.load(ctrl, CTRL.TOTAL_BATCHES);
-              while (true) {
-                const b = Atomics.add(ctrl, CTRL.WORK_CURSOR, 1);
+              const totalBatches = Atomics.load(ctrl, CTRL.TOTAL_BATCHES_0 + ringSlot);
+              const cursorIdx = CTRL.WORK_CURSOR_0 + (ringSlot << 4);
+              const doneIdx = CTRL.DONE_BATCHES_0 + (ringSlot << 4);
+              const stateBase = ringSlot * MAX_TASK_BATCHES;
+
+              while (Atomics.load(ctrl, CTRL.TASK_EPOCH) === epoch) {
+                const b = Atomics.add(ctrl, cursorIdx, 1);
                 if (b >= totalBatches) break;
-                if (Atomics.compareExchange(batchState, b, 0, 1) === 0) {
+                if (Atomics.compareExchange(batchState, stateBase + b, 0, 1) === 0) {
                   kernel.executeBatch(taskType, b, true);
-                  Atomics.store(batchState, b, 2);
-                  Atomics.add(ctrl, CTRL.DONE_BATCHES, 1);
+                  Atomics.store(batchState, stateBase + b, 2);
+                  Atomics.add(ctrl, doneIdx, 1);
                 }
               }
             }
@@ -1417,7 +1454,6 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         if (!SUPPORTS_SAB) return;
         const { ctrl } = this.arena.views;
         Atomics.store(ctrl, CTRL.SPIN_MODE, 0);
-        Atomics.store(ctrl, CTRL.TASK_TYPE, TASK.IDLE);
       }
 
       dispatchAndComplete(taskType, totalBatches) {
@@ -1437,38 +1473,45 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
           return;
         }
 
-        batchState.fill(0, 0, totalBatches);
-        Atomics.store(ctrl, CTRL.WORK_CURSOR, 0);
-        Atomics.store(ctrl, CTRL.DONE_BATCHES, 0);
-        Atomics.store(ctrl, CTRL.TOTAL_BATCHES, totalBatches);
-        Atomics.store(ctrl, CTRL.TASK_TYPE, taskType);
-        Atomics.add(ctrl, CTRL.TASK_EPOCH, 1);
+        const nextEpoch = (Atomics.load(ctrl, CTRL.TASK_EPOCH) + 1) | 0;
+        const ringSlot = nextEpoch & 3;
+        const cursorIdx = CTRL.WORK_CURSOR_0 + (ringSlot << 4);
+        const doneIdx = CTRL.DONE_BATCHES_0 + (ringSlot << 4);
+        const stateBase = ringSlot * MAX_TASK_BATCHES;
+
+        batchState.fill(0, stateBase, stateBase + totalBatches);
+        Atomics.store(ctrl, cursorIdx, 0);
+        Atomics.store(ctrl, doneIdx, 0);
+        Atomics.store(ctrl, CTRL.TOTAL_BATCHES_0 + ringSlot, totalBatches);
+        Atomics.store(ctrl, CTRL.TASK_TYPE_0 + ringSlot, taskType);
+
+        // Publish new epoch only after all ring-slot state is initialized
+        Atomics.store(ctrl, CTRL.TASK_EPOCH, nextEpoch);
         Atomics.notify(ctrl, CTRL.TASK_EPOCH);
 
         // Main-Thread Coordinator steals batches alongside the Worker Pool
         while (true) {
-          const b = Atomics.add(ctrl, CTRL.WORK_CURSOR, 1);
+          const b = Atomics.add(ctrl, cursorIdx, 1);
           if (b >= totalBatches) break;
-          if (Atomics.compareExchange(batchState, b, 0, 1) === 0) {
+          if (Atomics.compareExchange(batchState, stateBase + b, 0, 1) === 0) {
             kernel.executeBatch(taskType, b, false);
-            Atomics.store(batchState, b, 2);
-            Atomics.add(ctrl, CTRL.DONE_BATCHES, 1);
+            Atomics.store(batchState, stateBase + b, 2);
+            Atomics.add(ctrl, doneIdx, 1);
           }
         }
 
-        // Wait for any in-flight worker batches; reclaim unclaimed/straggling idempotent batches if needed
+        // Wait until all claimed batches in this ring slot reach completion
         let spins = 0;
-        while (Atomics.load(ctrl, CTRL.DONE_BATCHES) < totalBatches) {
-          if (++spins > 20000) {
+        while (Atomics.load(ctrl, doneIdx) < totalBatches) {
+          if (++spins > 4096) {
             for (let b = 0; b < totalBatches; b++) {
-              const st = Atomics.load(batchState, b);
-              if (st === 0 && Atomics.compareExchange(batchState, b, 0, 1) === 0) {
+              if (Atomics.load(batchState, stateBase + b) === 0 &&
+                  Atomics.compareExchange(batchState, stateBase + b, 0, 1) === 0) {
                 kernel.executeBatch(taskType, b, false);
-                Atomics.store(batchState, b, 2);
-                Atomics.add(ctrl, CTRL.DONE_BATCHES, 1);
+                Atomics.store(batchState, stateBase + b, 2);
+                Atomics.add(ctrl, doneIdx, 1);
               }
             }
-            if (spins > 250000) break;
           }
         }
       }
